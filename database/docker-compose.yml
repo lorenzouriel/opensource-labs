@@ -1,0 +1,322 @@
+name: sql
+
+services:
+  # -------------------------------------------------------------- prod1
+  # Primary lab instance.
+  prod1:
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    hostname: prod1
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?set MSSQL_SA_PASSWORD in .env}
+      MSSQL_AGENT_ENABLED: "true"
+      MSSQL_MEMORY_LIMIT_MB: ${PROD1_MEMORY_LIMIT_MB:-6144}
+      MSSQL_COLLATION: ${MSSQL_COLLATION:-SQL_Latin1_General_CP1_CI_AS}
+      MSSQL_ENABLE_HADR: "1"
+      TZ: ${TZ:-America/Sao_Paulo}
+    ports:
+      - "${PROD1_PORT:-1401}:1433"
+    volumes:
+      - prod1-data:/var/opt/mssql          # data, log, secrets, errorlog
+      - ./restore:/var/opt/mssql/restore:ro   # drop .bak here to import
+      - ./backups:/var/opt/mssql/backups      # BACKUP DATABASE writes here
+      - ./scripts:/scripts:ro
+      - ag-certs:/var/opt/mssql/ag-certs      # HADR endpoint cert exchange (ha profile)
+    mem_limit: ${PROD1_MEM_LIMIT:-8g}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -b -Q "SELECT 1" || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  # ----------------------------------------------------------- seed (opt)
+  # `docker compose --profile seed up seed` — rebuild the lab DB from a .bak.
+  seed:
+    profiles: ["seed"]
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    depends_on:
+      prod1:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint:
+      - /opt/mssql-tools18/bin/sqlcmd
+      - -S
+      - prod1
+      - -U
+      - sa
+      - -P
+      - ${MSSQL_SA_PASSWORD}
+      - -C
+      - -b
+      - -v
+      - DBNAME=${SEED_DB:-billing}
+      - -v
+      - BAKFILE=${SEED_BAK:-billing.bak}
+      - -i
+      - /scripts/01-restore.sql
+    restart: "no"
+
+  # ------------------------------------------------------------- prod2 (opt)
+  # `docker compose --profile ha up -d` — AG, replication, cross-instance CI/CD.
+  prod2:
+    profiles: ["ha"]
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    hostname: prod2
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      MSSQL_AGENT_ENABLED: "true"
+      MSSQL_MEMORY_LIMIT_MB: ${PROD2_MEMORY_LIMIT_MB:-4096}
+      MSSQL_COLLATION: ${MSSQL_COLLATION:-SQL_Latin1_General_CP1_CI_AS}
+      MSSQL_ENABLE_HADR: "1"
+      TZ: ${TZ:-America/Sao_Paulo}
+    ports:
+      - "${PROD2_PORT:-1402}:1433"
+    volumes:
+      - prod2-data:/var/opt/mssql
+      - ./backups:/var/opt/mssql/backups
+      - ag-certs:/var/opt/mssql/ag-certs
+    mem_limit: ${PROD2_MEM_LIMIT:-6g}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -b -Q "SELECT 1" || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  # --------------------------------------------------------------- dev (opt)
+  # `docker compose --profile dev up -d` — lightweight dev instance, isolated
+  # from prod1/prod2 so schema/breaking-change work doesn't touch the lab DB.
+  dev:
+    profiles: ["dev"]
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    hostname: dev
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?set MSSQL_SA_PASSWORD in .env}
+      MSSQL_AGENT_ENABLED: "true"
+      MSSQL_MEMORY_LIMIT_MB: ${DEV_MEMORY_LIMIT_MB:-2048}
+      MSSQL_COLLATION: ${MSSQL_COLLATION:-SQL_Latin1_General_CP1_CI_AS}
+      TZ: ${TZ:-America/Sao_Paulo}
+    ports:
+      - "${DEV_PORT:-1403}:1433"
+    volumes:
+      - dev-data:/var/opt/mssql
+      - ./restore:/var/opt/mssql/restore:ro
+      - ./backups:/var/opt/mssql/backups
+      - ./scripts:/scripts:ro
+    mem_limit: ${DEV_MEM_LIMIT:-3g}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -b -Q "SELECT 1" || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  # ----------------------------------------------------------- staging (opt)
+  # `docker compose --profile staging up -d` — pre-prod instance, separate
+  # from dev so promotion between the two mirrors a real environment chain.
+  staging:
+    profiles: ["staging"]
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    hostname: staging
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?set MSSQL_SA_PASSWORD in .env}
+      MSSQL_AGENT_ENABLED: "true"
+      MSSQL_MEMORY_LIMIT_MB: ${STAGING_MEMORY_LIMIT_MB:-2048}
+      MSSQL_COLLATION: ${MSSQL_COLLATION:-SQL_Latin1_General_CP1_CI_AS}
+      TZ: ${TZ:-America/Sao_Paulo}
+    ports:
+      - "${STAGING_PORT:-1404}:1433"
+    volumes:
+      - staging-data:/var/opt/mssql
+      - ./restore:/var/opt/mssql/restore:ro
+      - ./backups:/var/opt/mssql/backups
+      - ./scripts:/scripts:ro
+    mem_limit: ${STAGING_MEM_LIMIT:-3g}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -b -Q "SELECT 1" || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  # ---------------------------------------------------- ag-certs-init (opt)
+  # ag-certs is a fresh named volume owned by root; prod1/prod2 run as uid
+  # 10001 and can't write cert backups into it without this one-shot chown.
+  ag-certs-init:
+    profiles: ["ha"]
+    image: busybox
+    volumes:
+      - ag-certs:/data
+    command: ["sh", "-c", "chown -R 10001:0 /data"]
+    restart: "no"
+
+  # --------------------------------------------------------- ag-setup (opt)
+  # `docker compose --profile ha run --rm ag-setup` — cert-based HADR
+  # endpoints on prod1+prod2 and a CLUSTER_TYPE=NONE availability group
+  # (no WSFC/Pacemaker available across two plain containers).
+  ag-setup:
+    profiles: ["ha"]
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    depends_on:
+      prod1:
+        condition: service_healthy
+      prod2:
+        condition: service_healthy
+      ag-certs-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint:
+      - /opt/mssql-tools18/bin/sqlcmd
+      - -S
+      - prod1
+      - -U
+      - sa
+      - -P
+      - ${MSSQL_SA_PASSWORD}
+      - -C
+      - -b
+      - -v
+      - SAPW=${MSSQL_SA_PASSWORD}
+      - -v
+      - DBNAME=${AGDB:-agdb}
+      - -i
+      - /scripts/02-ag-setup.sql
+    restart: "no"
+
+  # ----------------------------------------------------------- db-build
+  # Builds database/database/database.sqlproj (SDK-style SQL project) into
+  # database.dacpac, and drops the sqlpackage CLI into the same shared
+  # volume so the db-deploy-* services below don't each have to install it.
+  # No profile → runs on every plain `docker compose up`, same as prod1.
+  db-build:
+    image: mcr.microsoft.com/dotnet/sdk:8.0
+    working_dir: /src
+    volumes:
+      - ./database/database:/src
+      - db-artifacts:/artifacts
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -e
+        dotnet build database.sqlproj -c Release -o /artifacts
+        dotnet tool install --tool-path /artifacts/tools microsoft.sqlpackage
+    restart: "no"
+
+  # ------------------------------------------------- db-deploy-prod1
+  # sqlpackage /Action:Publish creates the database if it doesn't exist yet,
+  # then reconciles its schema to match the dacpac on every `up`.
+  db-deploy-prod1:
+    image: mcr.microsoft.com/dotnet/sdk:8.0
+    depends_on:
+      prod1:
+        condition: service_healthy
+      db-build:
+        condition: service_completed_successfully
+    volumes:
+      - db-artifacts:/artifacts:ro
+    entrypoint: ["/artifacts/tools/sqlpackage"]
+    command:
+      - /Action:Publish
+      - /SourceFile:/artifacts/database.dacpac
+      - /TargetServerName:prod1
+      - /TargetDatabaseName:${APP_DB:-AppDB}
+      - /TargetUser:sa
+      - /TargetPassword:${MSSQL_SA_PASSWORD}
+      - /TargetTrustServerCertificate:True
+    restart: "no"
+
+  # ------------------------------------------------- db-deploy-prod2 (opt)
+  db-deploy-prod2:
+    profiles: ["ha"]
+    image: mcr.microsoft.com/dotnet/sdk:8.0
+    depends_on:
+      prod2:
+        condition: service_healthy
+      db-build:
+        condition: service_completed_successfully
+    volumes:
+      - db-artifacts:/artifacts:ro
+    entrypoint: ["/artifacts/tools/sqlpackage"]
+    command:
+      - /Action:Publish
+      - /SourceFile:/artifacts/database.dacpac
+      - /TargetServerName:prod2
+      - /TargetDatabaseName:${APP_DB:-AppDB}
+      - /TargetUser:sa
+      - /TargetPassword:${MSSQL_SA_PASSWORD}
+      - /TargetTrustServerCertificate:True
+    restart: "no"
+
+  # --------------------------------------------------- db-deploy-dev (opt)
+  db-deploy-dev:
+    profiles: ["dev"]
+    image: mcr.microsoft.com/dotnet/sdk:8.0
+    depends_on:
+      dev:
+        condition: service_healthy
+      db-build:
+        condition: service_completed_successfully
+    volumes:
+      - db-artifacts:/artifacts:ro
+    entrypoint: ["/artifacts/tools/sqlpackage"]
+    command:
+      - /Action:Publish
+      - /SourceFile:/artifacts/database.dacpac
+      - /TargetServerName:dev
+      - /TargetDatabaseName:${APP_DB:-AppDB}
+      - /TargetUser:sa
+      - /TargetPassword:${MSSQL_SA_PASSWORD}
+      - /TargetTrustServerCertificate:True
+    restart: "no"
+
+  # ----------------------------------------------- db-deploy-staging (opt)
+  db-deploy-staging:
+    profiles: ["staging"]
+    image: mcr.microsoft.com/dotnet/sdk:8.0
+    depends_on:
+      staging:
+        condition: service_healthy
+      db-build:
+        condition: service_completed_successfully
+    volumes:
+      - db-artifacts:/artifacts:ro
+    entrypoint: ["/artifacts/tools/sqlpackage"]
+    command:
+      - /Action:Publish
+      - /SourceFile:/artifacts/database.dacpac
+      - /TargetServerName:staging
+      - /TargetDatabaseName:${APP_DB:-AppDB}
+      - /TargetUser:sa
+      - /TargetPassword:${MSSQL_SA_PASSWORD}
+      - /TargetTrustServerCertificate:True
+    restart: "no"
+
+volumes:
+  prod1-data:
+  prod2-data:
+  dev-data:
+  staging-data:
+  ag-certs:
+  db-artifacts:
