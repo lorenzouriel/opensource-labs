@@ -1,0 +1,80 @@
+name: lakehouse
+
+services:
+  # -------------------------------------------------------------- bucket-init
+  # One-shot: creates the Iceberg warehouse bucket on rustfs before
+  # iceberg-rest or trino touch it. Exits 0 and stays stopped — expected.
+  bucket-init:
+    image: quay.io/minio/mc:latest
+    environment:
+      MC_HOST_rustfs: http://${RUSTFS_ACCESS_KEY:?set RUSTFS_ACCESS_KEY in .env}:${RUSTFS_SECRET_KEY:?set RUSTFS_SECRET_KEY in .env}@rustfs:9000
+    entrypoint: ["sh", "-c"]
+    command:
+      - "mc mb --ignore-existing rustfs/${ICEBERG_WAREHOUSE_BUCKET:-warehouse}"
+    restart: "no"
+    networks:
+      - object-storage-network
+
+  # ------------------------------------------------------------ iceberg-rest
+  # Apache Iceberg REST catalog (tabulario/iceberg-rest, Apache 2.0). Tracks
+  # table/schema metadata; data files land in rustfs under s3://<bucket>/.
+  iceberg-rest:
+    image: tabulario/iceberg-rest:${ICEBERG_REST_VERSION:-latest}
+    container_name: iceberg-rest
+    ports:
+      - "${ICEBERG_REST_PORT:-8181}:8181"
+    environment:
+      CATALOG_WAREHOUSE: s3://${ICEBERG_WAREHOUSE_BUCKET:-warehouse}/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://rustfs:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:?set RUSTFS_ACCESS_KEY in .env}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:?set RUSTFS_SECRET_KEY in .env}
+      AWS_REGION: us-east-1
+    depends_on:
+      bucket-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8181/v1/config || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - object-storage-network
+
+  # ------------------------------------------------------------------ trino
+  # Single-node Trino coordinator, Iceberg REST catalog wired to rustfs.
+  trino:
+    image: trinodb/trino:${TRINO_VERSION:-latest}
+    container_name: trino
+    ports:
+      - "${TRINO_PORT:-8080}:8080"
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?set RUSTFS_ACCESS_KEY in .env}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?set RUSTFS_SECRET_KEY in .env}
+      ICEBERG_WAREHOUSE_BUCKET: ${ICEBERG_WAREHOUSE_BUCKET:-warehouse}
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+    depends_on:
+      iceberg-rest:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/v1/info | grep -q '\"starting\":false'"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - object-storage-network
+
+networks:
+  # Joins the rustfs stack's network so services can resolve `rustfs` by
+  # name. Compose derives this name from object-storage/docker-compose.yml's
+  # `name: object-storage` + its `object-storage-network` key — start that
+  # stack first (`docker compose up -d` in ../object-storage).
+  object-storage-network:
+    external: true
+    name: object-storage_object-storage-network
